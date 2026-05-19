@@ -143,13 +143,10 @@ public class NodeJsServiceCaller {
 
     /**
      * Build a ProcessBuilder for running a Node.js inline script.
-     * When the node path is a WSL path, prepends 'wsl' to the command.
+     * Delegates to {@link NodeDetector#buildNodeInlineCommand} so WSL prefixing is centralised.
      */
     private ProcessBuilder buildNodeProcessBuilder(String nodePath, String nodeScript) {
-        if (NodeDetector.isWslPath(nodePath)) {
-            return new ProcessBuilder("wsl", nodePath, "-e", nodeScript);
-        }
-        return new ProcessBuilder(nodePath, "-e", nodeScript);
+        return new ProcessBuilder(NodeDetector.buildNodeInlineCommand(nodePath, nodeScript));
     }
 
     /**

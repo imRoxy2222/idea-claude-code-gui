@@ -58,6 +58,14 @@ public class NodeDetectorWslTest {
         assertEquals("relative/path", NodeDetector.convertToWslPath("relative\\path"));
     }
 
+    @Test
+    public void convertToWslPath_driveLetterWithoutSeparator_insertsSeparator() {
+        // Edge case: "C:Users\foo" (legacy form, no separator after colon)
+        // should still produce a well-formed /mnt/c/Users/foo path.
+        assertEquals("/mnt/c/Users/foo", NodeDetector.convertToWslPath("C:Users\\foo"));
+        assertEquals("/mnt/d/", NodeDetector.convertToWslPath("D:"));
+    }
+
     // =========================================================================
     // isWslPath  (always false on non-Windows; tested via static method contract)
     // =========================================================================
@@ -105,5 +113,37 @@ public class NodeDetectorWslTest {
         assertEquals(2, cmd.size());
         assertEquals("C:\\Program Files\\nodejs\\node.exe", cmd.get(0));
         assertEquals("C:\\Users\\foo\\script.js", cmd.get(1));
+    }
+
+    // =========================================================================
+    // buildNodeInlineCommand
+    // =========================================================================
+
+    @Test
+    public void buildNodeInlineCommand_nonWslPath_returnsNodeEvalScript() {
+        List<String> cmd = NodeDetector.buildNodeInlineCommand(
+                "/usr/local/bin/node", "console.log('hi');");
+        assertNotNull(cmd);
+        assertEquals(3, cmd.size());
+        assertEquals("/usr/local/bin/node", cmd.get(0));
+        assertEquals("-e", cmd.get(1));
+        assertEquals("console.log('hi');", cmd.get(2));
+    }
+
+    @Test
+    public void buildNodeInlineCommand_windowsPath_doesNotPrependWsl() {
+        List<String> cmd = NodeDetector.buildNodeInlineCommand(
+                "C:\\Program Files\\nodejs\\node.exe", "console.log(1);");
+        assertNotNull(cmd);
+        assertEquals(3, cmd.size());
+        assertEquals("C:\\Program Files\\nodejs\\node.exe", cmd.get(0));
+        assertEquals("-e", cmd.get(1));
+    }
+
+    @Test
+    public void buildNodeInlineCommand_returnsModifiableList() {
+        List<String> cmd = NodeDetector.buildNodeInlineCommand("node", "1+1");
+        cmd.add("extra");
+        assertEquals(4, cmd.size());
     }
 }

@@ -603,6 +603,28 @@ public class NodeDetector {
     }
 
     /**
+     * Builds a WSL-aware command list for running an inline Node.js script via {@code -e <script>}.
+     * When {@code nodePath} is a WSL path, prepends {@code "wsl"}. The script body is passed through
+     * as-is; callers are responsible for any path conversion within the script.
+     *
+     * <p>Use this when invoking Node with inline code rather than a script file.
+     *
+     * @param nodePath   Node.js executable path (may be a WSL Unix-style path on Windows)
+     * @param scriptBody inline JavaScript to execute
+     * @return mutable command list
+     */
+    public static List<String> buildNodeInlineCommand(String nodePath, String scriptBody) {
+        List<String> command = new ArrayList<>();
+        if (isWslPath(nodePath)) {
+            command.add("wsl");
+        }
+        command.add(nodePath);
+        command.add("-e");
+        command.add(scriptBody);
+        return command;
+    }
+
+    /**
      * Converts a Windows file path to a WSL-accessible path.
      * For example: "C:\Users\foo\bar" becomes "/mnt/c/Users/foo/bar".
      * UNC paths like "\\wsl.localhost\Ubuntu\home\..." are converted to "/home/...".
@@ -621,14 +643,14 @@ public class NodeDetector {
         }
         // UNC WSL path: \\wsl.localhost\<distro>\<path> or \\wsl$\<distro>\<path>
         if (windowsPath.startsWith("\\\\wsl")) {
-            // Remove the \\wsl.localhost\Distro or \\wsl$\Distro prefix
-            String normalized = windowsPath.replace('\\', '/');
+            // Strip the \\<host>\<distro> prefix and keep the path inside the distro.
             // normalized: //wsl.localhost/Ubuntu/home/... or //wsl$/Ubuntu/home/...
-            int thirdSlash = normalized.indexOf('/', 2); // after //wsl.localhost
-            if (thirdSlash > 0) {
-                int fourthSlash = normalized.indexOf('/', thirdSlash + 1); // after /Ubuntu
-                if (fourthSlash > 0) {
-                    return normalized.substring(fourthSlash); // /home/...
+            String normalized = windowsPath.replace('\\', '/');
+            int distroNameStart = normalized.indexOf('/', 2);        // index of '/' before <distro>
+            if (distroNameStart > 0) {
+                int distroPathStart = normalized.indexOf('/', distroNameStart + 1); // index of '/' after <distro>
+                if (distroPathStart > 0) {
+                    return normalized.substring(distroPathStart);    // /home/...
                 }
             }
         }
@@ -636,6 +658,10 @@ public class NodeDetector {
         if (windowsPath.length() >= 2 && windowsPath.charAt(1) == ':') {
             char drive = Character.toLowerCase(windowsPath.charAt(0));
             String rest = windowsPath.substring(2).replace('\\', '/');
+            // Ensure separator between drive letter and remainder for inputs like "C:Users\foo"
+            if (rest.isEmpty() || rest.charAt(0) != '/') {
+                rest = "/" + rest;
+            }
             return "/mnt/" + drive + rest;
         }
         // Fallback: just replace backslashes
