@@ -632,6 +632,54 @@ test('REGRESSION (PR#1205 bug 2): assistant snapshot for a brand-new block must 
   );
 });
 
+test('REGRESSION (snapshot single-source): processMessageContent absorbs a snapshot-mode mid-stream rewrite instead of mis-slicing it', () => {
+  // The snapshot path used to derive its delta with a naive
+  // currentText.substring(previousBlock.length), which assumes the snapshot is
+  // always a prefix-extension of the accumulated content. When a Claude-compatible
+  // provider in cumulative-snapshot mode emits a FINAL assistant message that
+  // rewrites the middle of a block (shared prefix, divergent middle, longer
+  // overall), the substring sliced an arbitrary tail ("es") and emitted garbage,
+  // diverging from the live processStreamEvent path which absorbs the rewrite.
+  // Routing the snapshot through resolveSnapshotDelta (the same engine) makes the
+  // two paths single-sourced: the corrective rewrite is absorbed (novel === '').
+  const state = makeTurnState(true);
+
+  const captured = captureStdout(() => {
+    // Two live deltas: the second extends the first → confirms snapshot mode.
+    processStreamEvent(
+      { type: 'stream_event', event: { type: 'content_block_delta', index: 0,
+        delta: { type: 'text_delta', text: 'The result is ' } } },
+      state,
+    );
+    processStreamEvent(
+      { type: 'stream_event', event: { type: 'content_block_delta', index: 0,
+        delta: { type: 'text_delta', text: 'The result is 42 items' } } },
+      state,
+    );
+    state.hasStreamEvents = true;
+
+    // Final snapshot rewrites the middle: "42 items" → "43 oranges".
+    const finalSnapshot = {
+      type: 'assistant',
+      message: { content: [{ type: 'text', text: 'The result is 43 oranges' }] },
+    };
+    processMessageContent(finalSnapshot, state);
+  });
+
+  const emitted = tagLines(captured, '[CONTENT_DELTA]')
+    .map((line) => JSON.parse(line.replace(/^\[CONTENT_DELTA\]\s+/, '').trim()))
+    .join('');
+
+  // Live path emitted "The result is " + "42 items"; the corrective snapshot is
+  // absorbed rather than appending a mis-sliced "es" tail (the pre-refactor bug).
+  assert.equal(
+    emitted,
+    'The result is 42 items',
+    `snapshot rewrite must be absorbed, not mis-sliced; got "${emitted}"`,
+  );
+  assert.ok(!emitted.includes('oranges'), 'must not splice the divergent rewrite tail');
+});
+
 test('REGRESSION (PR#1205 bug 2): tail-fill is still emitted when block has prior partial content', () => {
   // The suppression in bug 2 must NOT block legitimate tail-fill: when the
   // block already has streamed content and the snapshot extends it, the

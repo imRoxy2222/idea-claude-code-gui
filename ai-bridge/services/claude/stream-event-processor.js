@@ -1,6 +1,6 @@
 import { emitAccumulatedUsage, mergeUsage } from '../../utils/usage-utils.js';
 import { truncateErrorContent, truncateToolResultBlock } from './message-output-filter.js';
-import { getBlockMap, normalizeStreamDelta, rememberStreamSnapshot } from './stream-delta-normalizer.js';
+import { normalizeStreamDelta, resolveSnapshotDelta } from './stream-delta-normalizer.js';
 
 export function emitUsageTag(msg) {
   if (msg.type === 'assistant' && msg.message?.usage) {
@@ -72,58 +72,52 @@ export function processMessageContent(msg, turnState) {
     for (let i = 0; i < content.length; i += 1) {
       const block = content[i];
       if (block.type === 'text') {
-        const currentText = block.text || '';
-        const textBlockMap = getBlockMap(turnState, 'textBlockContentByIndex');
-        const previousBlock = textBlockMap.get(i) || '';
-        rememberStreamSnapshot(turnState, 'text', i, currentText);
-        // Compare against per-block content rather than lastAssistantContent.
-        // After a silent snapshot-mode correction (absorbed by computeNovelDelta)
-        // the blockMap is updated but lastAssistantContent is stale.
-        //
-        // When streaming events have started but this block is still empty the
-        // stream will deliver the content shortly — emitting the full block text
-        // here would duplicate every token.  Only emit when either no stream
-        // events have fired at all (pre-stream fallback) or the block already
-        // has partial content (genuine tail-fill / snapshot correction).
-        if (turnState.streamingEnabled && currentText.length > previousBlock.length) {
-          const delta = currentText.substring(previousBlock.length);
-          if (delta && (!turnState.hasStreamEvents || previousBlock.length > 0)) {
-            process.stdout.write(`[CONTENT_DELTA] ${JSON.stringify(delta)}\n`);
-          }
-          turnState.lastAssistantContent = currentText;
-        } else if (!turnState.streamingEnabled) {
-          console.log('[CONTENT]', truncateErrorContent(currentText));
-        }
+        emitSnapshotText(block.text || '', turnState, i);
       } else if (block.type === 'thinking') {
-        const thinkingText = block.thinking || block.text || '';
-        const thinkingBlockMap = getBlockMap(turnState, 'thinkingBlockContentByIndex');
-        const previousThinkingBlock = thinkingBlockMap.get(i) || '';
-        rememberStreamSnapshot(turnState, 'thinking', i, thinkingText);
-        if (turnState.streamingEnabled && thinkingText.length > previousThinkingBlock.length) {
-          const delta = thinkingText.substring(previousThinkingBlock.length);
-          if (delta && (!turnState.hasStreamEvents || previousThinkingBlock.length > 0)) {
-            process.stdout.write(`[THINKING_DELTA] ${JSON.stringify(delta)}\n`);
-          }
-          turnState.lastThinkingContent = thinkingText;
-        } else if (!turnState.streamingEnabled) {
-          console.log('[THINKING]', thinkingText);
-        }
+        emitSnapshotThinking(block.thinking || block.text || '', turnState, i);
       }
     }
   } else if (typeof content === 'string') {
-    const textBlockMap = getBlockMap(turnState, 'textBlockContentByIndex');
-    const previousBlock = textBlockMap.get(0) || '';
-    rememberStreamSnapshot(turnState, 'text', 0, content);
-    if (turnState.streamingEnabled && content.length > previousBlock.length) {
-      const delta = content.substring(previousBlock.length);
-      if (delta && (!turnState.hasStreamEvents || previousBlock.length > 0)) {
-        process.stdout.write(`[CONTENT_DELTA] ${JSON.stringify(delta)}\n`);
-      }
-      turnState.lastAssistantContent = content;
-    } else if (!turnState.streamingEnabled) {
-      console.log('[CONTENT]', truncateErrorContent(content));
-    }
+    emitSnapshotText(content, turnState, 0);
   }
+}
+
+/**
+ * Emit a text block carried by an assistant snapshot.
+ *
+ * Routes the full snapshot through resolveSnapshotDelta — the same novelty/
+ * correction engine the live delta path uses — so a mid-stream corrective
+ * rewrite is absorbed rather than mis-sliced by a naive substring, and the
+ * block map / mode bookkeeping stay single-sourced.
+ *
+ * Emit gate (unchanged from the tail-fill / new-block-suppression fix):
+ *   - !hasStreamEvents: pre-stream fallback, emit the whole computed delta
+ *   - hasStreamEvents && hadPrevious: genuine tail-fill / snapshot correction
+ *   - hasStreamEvents && !hadPrevious: stream will deliver this block, suppress
+ */
+function emitSnapshotText(currentText, turnState, blockIndex) {
+  if (!turnState.streamingEnabled) {
+    console.log('[CONTENT]', truncateErrorContent(currentText));
+    return;
+  }
+  const { delta, hadPrevious } = resolveSnapshotDelta(turnState, 'text', blockIndex, currentText);
+  if (delta && (!turnState.hasStreamEvents || hadPrevious)) {
+    process.stdout.write(`[CONTENT_DELTA] ${JSON.stringify(delta)}\n`);
+  }
+  turnState.lastAssistantContent = currentText;
+}
+
+/** Thinking-block counterpart to {@link emitSnapshotText}. */
+function emitSnapshotThinking(thinkingText, turnState, blockIndex) {
+  if (!turnState.streamingEnabled) {
+    console.log('[THINKING]', thinkingText);
+    return;
+  }
+  const { delta, hadPrevious } = resolveSnapshotDelta(turnState, 'thinking', blockIndex, thinkingText);
+  if (delta && (!turnState.hasStreamEvents || hadPrevious)) {
+    process.stdout.write(`[THINKING_DELTA] ${JSON.stringify(delta)}\n`);
+  }
+  turnState.lastThinkingContent = thinkingText;
 }
 
 export function processToolResultMessages(msg) {
