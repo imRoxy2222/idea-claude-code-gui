@@ -98,7 +98,9 @@ public class ClaudeHistoryReader {
         public String cwd;
 
         public static class Message {
+            public String id;
             public String role;
+            public String model;
             public Object content;
             public Usage usage;
         }

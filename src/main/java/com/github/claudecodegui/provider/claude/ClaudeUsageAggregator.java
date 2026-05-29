@@ -26,30 +26,62 @@ class ClaudeUsageAggregator {
 
     private static final Logger LOG = Logger.getInstance(ClaudeUsageAggregator.class);
 
+    /**
+     * Per-model pricing in USD per 1M tokens.
+     * Source: https://platform.claude.com/docs/en/about-claude/pricing
+     *
+     * Note: Opus 4 / 4.1 use the legacy $15/$75 tier. Opus 4.5 and later
+     * (4.5, 4.6, 4.7, 4.8) all share $5/$25. Matched by ordered prefix list
+     * below so that more-specific IDs (e.g. opus-4-7) are tried before
+     * shorter prefixes (opus-4) that would otherwise capture them.
+     */
     private static final Map<String, Map<String, Double>> MODEL_PRICING = new HashMap<>();
 
+    private static final List<String> PRICING_PREFIX_ORDER = List.of(
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-opus-4-5",
+            "claude-opus-4-1",
+            "claude-opus-4",
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "claude-sonnet-4",
+            "claude-haiku-4-5",
+            "claude-haiku-4"
+    );
+
     static {
-        Map<String, Double> opus = new HashMap<>();
-        opus.put("input", 15.0);
-        opus.put("output", 75.0);
-        opus.put("cacheWrite", 18.75);
-        opus.put("cacheRead", 1.50);
-        MODEL_PRICING.put("claude-opus-4", opus);
+        Map<String, Double> opusLegacy = pricing(15.0, 75.0, 18.75, 1.50);
+        MODEL_PRICING.put("claude-opus-4", opusLegacy);
+        MODEL_PRICING.put("claude-opus-4-1", opusLegacy);
 
-        Map<String, Double> sonnet = new HashMap<>();
-        sonnet.put("input", 3.0);
-        sonnet.put("output", 15.0);
-        sonnet.put("cacheWrite", 3.75);
-        sonnet.put("cacheRead", 0.30);
+        Map<String, Double> opusCurrent = pricing(5.0, 25.0, 6.25, 0.50);
+        MODEL_PRICING.put("claude-opus-4-5", opusCurrent);
+        MODEL_PRICING.put("claude-opus-4-6", opusCurrent);
+        MODEL_PRICING.put("claude-opus-4-7", opusCurrent);
+        MODEL_PRICING.put("claude-opus-4-8", opusCurrent);
+
+        Map<String, Double> sonnet = pricing(3.0, 15.0, 3.75, 0.30);
         MODEL_PRICING.put("claude-sonnet-4", sonnet);
+        MODEL_PRICING.put("claude-sonnet-4-5", sonnet);
+        MODEL_PRICING.put("claude-sonnet-4-6", sonnet);
 
-        Map<String, Double> haiku = new HashMap<>();
-        haiku.put("input", 0.8);
-        haiku.put("output", 4.0);
-        haiku.put("cacheWrite", 1.0);
-        haiku.put("cacheRead", 0.08);
+        Map<String, Double> haiku = pricing(1.0, 5.0, 1.25, 0.10);
         MODEL_PRICING.put("claude-haiku-4", haiku);
+        MODEL_PRICING.put("claude-haiku-4-5", haiku);
     }
+
+    private static Map<String, Double> pricing(double input, double output, double cacheWrite, double cacheRead) {
+        Map<String, Double> p = new HashMap<>();
+        p.put("input", input);
+        p.put("output", output);
+        p.put("cacheWrite", cacheWrite);
+        p.put("cacheRead", cacheRead);
+        return p;
+    }
+
+    private static final Map<String, Double> DEFAULT_PRICING = MODEL_PRICING.get("claude-sonnet-4-6");
 
     private final Path projectsDir;
     private final ClaudeHistoryParser parser;
@@ -129,13 +161,20 @@ class ClaudeUsageAggregator {
     }
 
     private Map<String, Double> getModelPricing(String model) {
-        String modelLower = model.toLowerCase();
-        if (modelLower.contains("opus-4") || modelLower.contains("claude-opus-4")) {
-            return MODEL_PRICING.get("claude-opus-4");
-        } else if (modelLower.contains("haiku-4") || modelLower.contains("claude-haiku-4")) {
-            return MODEL_PRICING.get("claude-haiku-4");
+        if (model == null || model.isEmpty()) {
+            return DEFAULT_PRICING;
         }
-        return MODEL_PRICING.get("claude-sonnet-4");
+        String normalized = model.toLowerCase();
+        int claudeIdx = normalized.indexOf("claude-");
+        if (claudeIdx > 0) {
+            normalized = normalized.substring(claudeIdx);
+        }
+        for (String prefix : PRICING_PREFIX_ORDER) {
+            if (normalized.startsWith(prefix)) {
+                return MODEL_PRICING.get(prefix);
+            }
+        }
+        return DEFAULT_PRICING;
     }
 
     private List<ClaudeHistoryReader.SessionSummary> readSessionsFromDir(Path projectDir) {
@@ -166,6 +205,12 @@ class ClaudeUsageAggregator {
             long firstTimestamp = 0;
             String summary = null;
 
+            // Claude Code stores each content block (thinking, tool_use, text) of a single
+            // assistant API response as its own JSONL line, all sharing the same message.id
+            // and a duplicated usage payload. Sum once per unique message.id, otherwise
+            // tokens and cost are inflated by the average blocks-per-response (often ~2x).
+            Set<String> seenMessageIds = new HashSet<>();
+
             String line;
             while ((line = reader.readLine()) != null) {
                 if (line.trim().isEmpty()) continue;
@@ -186,6 +231,11 @@ class ClaudeUsageAggregator {
                     }
 
                     if ("assistant".equals(msg.type) && msg.message != null && msg.message.usage != null) {
+                        String messageId = msg.message.id;
+                        if (messageId != null && !seenMessageIds.add(messageId)) {
+                            continue;
+                        }
+
                         ClaudeHistoryReader.ConversationMessage.Usage u = msg.message.usage;
 
                         if (u.input_tokens > 0 || u.output_tokens > 0 || u.cache_creation_input_tokens > 0 || u.cache_read_input_tokens > 0) {
@@ -194,14 +244,8 @@ class ClaudeUsageAggregator {
                             usage.cacheWriteTokens += u.cache_creation_input_tokens;
                             usage.cacheReadTokens += u.cache_read_input_tokens;
 
-                            if (msg.message.role != null && model.equals("unknown")) {
-                                Map<String, Object> rawMap = gson.fromJson(line, Map.class);
-                                if (rawMap.containsKey("message")) {
-                                    Map m = (Map) rawMap.get("message");
-                                    if (m.containsKey("model")) {
-                                        model = (String) m.get("model");
-                                    }
-                                }
+                            if (model.equals("unknown") && msg.message.model != null) {
+                                model = msg.message.model;
                             }
 
                             Map<String, Double> pricing = getModelPricing(model);
